@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  parser:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../data:/app/data
+    env_file:
+      - ../.env
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    command: >
+      --input /app/data/input/input.docx
+      --catalog /app/data/catalog/catalog.xlsx
+      --output /app/data/output/result.xlsx
