@@ -9,6 +9,10 @@ from parser.doc_converter import convert_doc_to_docx
 logger = logging.getLogger(__name__)
 
 
+def _normalize_cell(text: str) -> str:
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
 def _parse_docx(file_path: Path) -> str:
     doc = docx.Document(str(file_path))
     text = []
@@ -17,7 +21,7 @@ def _parse_docx(file_path: Path) -> str:
             text.append(para.text)
     for table in doc.tables:
         for row in table.rows:
-            row_text = " | ".join(cell.text.strip() for cell in row.cells)
+            row_text = " | ".join(_normalize_cell(cell.text) for cell in row.cells)
             if row_text.strip():
                 text.append(row_text)
     return "\n".join(text)

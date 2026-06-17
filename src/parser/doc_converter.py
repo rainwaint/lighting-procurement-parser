@@ -27,6 +27,33 @@ def _convert_with_soffice(doc_path: Path, out_dir: Path) -> Path:
     raise FileNotFoundError("LibreOffice not found")
 
 
+def _convert_with_powershell_word(doc_path: Path, out_dir: Path) -> Path:
+    docx_path = out_dir / f"{doc_path.stem}.docx"
+    script = f"""
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+try {{
+  $doc = $word.Documents.Open('{doc_path.resolve()}')
+  $doc.SaveAs2('{docx_path.resolve()}', 16)
+  $doc.Close()
+}} finally {{
+  $word.Quit()
+  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
+}}
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    if not docx_path.exists():
+        raise RuntimeError("Word conversion produced no output")
+    return docx_path
+
+
 def _convert_with_word_com(doc_path: Path, out_dir: Path) -> Path:
     import win32com.client
 
@@ -52,7 +79,7 @@ def convert_doc_to_docx(doc_path: str) -> Path:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         errors = []
-        for converter in (_convert_with_soffice, _convert_with_word_com):
+        for converter in (_convert_with_soffice, _convert_with_word_com, _convert_with_powershell_word):
             try:
                 docx = converter(path, tmp_dir)
                 fd, persistent_name = tempfile.mkstemp(suffix=".docx")

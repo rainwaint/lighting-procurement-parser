@@ -9,7 +9,11 @@ logger = logging.getLogger(__name__)
 
 EXACT_THRESHOLD = 0.05
 CLOSE_THRESHOLD = 0.5
-NAME_WEIGHT = 0.35
+NAME_WEIGHT = 0.55
+TYPE_MISMATCH_PENALTY = 0.75
+
+FIXTURE_KEYWORDS = ("светильник", "прожектор", "комплекс", "светодиод")
+SUPPORT_KEYWORDS = ("опора", "кронштейн", "закладн", "накладк", "декоратив", "комплектующ")
 
 
 class CatalogMatcher:
@@ -28,66 +32,123 @@ class CatalogMatcher:
                 return col
         return None
 
+    def _collect_specs_text(self, row: pd.Series, df: pd.DataFrame) -> str:
+        parts = []
+        for keywords in (
+            ("характер", "spec"),
+            ("описан", "общее"),
+            ("электротех",),
+            ("конструкт",),
+        ):
+            col = self._find_column(df, keywords)
+            if col and pd.notna(row.get(col)):
+                parts.append(str(row[col]))
+
+        dim_col = self._find_column(df, ("размер", "габарит", "dimension"))
+        if dim_col and pd.notna(row.get(dim_col)):
+            parts.append(str(row[dim_col]))
+
+        for dim_key in ("д", "ш", "в"):
+            if dim_key in df.columns and pd.notna(row.get(dim_key)):
+                parts.append(f"{dim_key}={row[dim_key]}")
+
+        return " ".join(parts)
+
     def _parse_catalog(self):
-        dim_pattern = re.compile(
-            r"(?:размер|габарит)[^:]*:\s*(\d+)\s*[xх×]\s*(\d+)|(\d+)\s*[xх×]\s*(\d+)\s*м?м?",
+        power_pattern = re.compile(
+            r"мощность\s*[–—\-:/]*\s*(\d+(?:[.,]\d+)?)\s*в?т?",
             re.IGNORECASE,
         )
-        power_pattern = re.compile(r"мощность[^:]*:\s*([\d.]+)\s*[вw]", re.IGNORECASE)
-        temp_pattern = re.compile(r"(?:цветовая\s+)?температура[^:]*:\s*([\d.]+)\s*[кk]", re.IGNORECASE)
-        lumens_pattern = re.compile(r"световой\s+поток[^:]*:\s*([\d.]+)\s*[лl]", re.IGNORECASE)
+        temp_pattern = re.compile(
+            r"(?:цветовая\s+)?температура[^0-9]{0,20}(\d+(?:[.,]\d+)?)\s*[кk]",
+            re.IGNORECASE,
+        )
+        lumens_pattern = re.compile(
+            r"(?:расчетный\s+)?световой\s+поток[^0-9]{0,20}"
+            r"(\d[\d\s]*(?:[.,]\d+)?)(?:\s*[–—\-]\s*(\d[\d\s]*(?:[.,]\d+)?))?\s*(?:лм|lm)?",
+            re.IGNORECASE,
+        )
+        dim_pattern = re.compile(
+            r"(?:габарит|размер)[^0-9]{0,30}"
+            r"(?:\(д\*ш\*в\)\s*)?"
+            r"(\d+)\s*[*xх×]\s*(\d+)"
+            r"(?:\s*[*xх×]\s*(\d+))?"
+            r"|d\s*(\d+)\s*[*xх×]\s*(\d+)"
+            r"|(\d+)\s*[*xх×]\s*(\d+)\s*м?м?",
+            re.IGNORECASE,
+        )
 
         for sheet, df in self.catalog.items():
             name_col = self._find_column(df, ("наимен", "назван", "name"))
-            specs_col = self._find_column(df, ("характер", "spec"))
-            dim_col = self._find_column(df, ("размер", "габарит", "dimension"))
 
             for idx, row in df.iterrows():
-                specs_text = ""
-                if specs_col and pd.notna(row.get(specs_col)):
-                    specs_text = str(row[specs_col])
-                elif name_col and pd.notna(row.get(name_col)):
-                    specs_text = str(row[name_col])
+                combined = self._collect_specs_text(row, df)
+                if name_col and pd.notna(row.get(name_col)):
+                    combined = f"{row[name_col]} {combined}"
 
-                combined = specs_text
-                if dim_col and pd.notna(row.get(dim_col)):
-                    combined = f"{combined} {row[dim_col]}"
+                power_match = power_pattern.search(combined)
+                if power_match:
+                    df.at[idx, "power_w"] = float(power_match.group(1).replace(",", ".").replace(" ", ""))
 
-                for pattern, field in (
-                    (power_pattern, "power_w"),
-                    (temp_pattern, "color_temp_k"),
-                    (lumens_pattern, "lumens"),
-                ):
-                    match = pattern.search(combined)
-                    if match:
-                        df.at[idx, field] = float(match.group(1))
+                temp_match = temp_pattern.search(combined)
+                if temp_match:
+                    df.at[idx, "color_temp_k"] = float(temp_match.group(1).replace(",", "."))
 
-                if dim_col and pd.notna(row.get(dim_col)):
-                    w, h = self._parse_dims(str(row[dim_col]))
-                else:
-                    w, h = None, None
-                if w is None:
-                    match = dim_pattern.search(combined)
-                    if match:
-                        w = float(match.group(1) or match.group(3))
-                        h = float(match.group(2) or match.group(4))
-                if w is not None:
-                    df.at[idx, "dimensions"] = f"{int(w)}x{int(h)} мм"
+                lumens_match = lumens_pattern.search(combined)
+                if lumens_match:
+                    low = float(lumens_match.group(1).replace(",", ".").replace(" ", ""))
+                    high = lumens_match.group(2)
+                    df.at[idx, "lumens"] = (
+                        (low + float(high.replace(",", ".").replace(" ", ""))) / 2
+                        if high
+                        else low
+                    )
+
+                dim_match = dim_pattern.search(combined)
+                if dim_match:
+                    w = dim_match.group(1) or dim_match.group(4) or dim_match.group(6)
+                    h = dim_match.group(2) or dim_match.group(5) or dim_match.group(7)
+                    if w and h:
+                        df.at[idx, "dimensions"] = f"{int(float(w))}x{int(float(h))} мм"
+                elif all(key in df.columns for key in ("д", "ш", "в")):
+                    d_val, w_val, h_val = row.get("д"), row.get("ш"), row.get("в")
+                    if pd.notna(d_val) and pd.notna(w_val):
+                        depth = f"x{int(float(h_val))}" if pd.notna(h_val) else ""
+                        df.at[idx, "dimensions"] = f"{int(float(d_val))}x{int(float(w_val))}{depth} мм"
 
                 if name_col and pd.notna(row.get(name_col)):
-                    df.at[idx, "_name"] = str(row[name_col]).strip()
-                if specs_col and pd.notna(row.get(specs_col)):
-                    df.at[idx, "_specs"] = str(row[specs_col]).strip()
-                elif specs_text:
-                    df.at[idx, "_specs"] = specs_text.strip()
+                    df.at[idx, "_name"] = str(row[name_col]).strip().replace("\n", " ")
+                if combined.strip():
+                    df.at[idx, "_specs"] = combined.strip()
 
     def _parse_dims(self, dim_str: str) -> Tuple[Optional[float], Optional[float]]:
         if not dim_str:
             return None, None
-        match = re.search(r"(\d+)\s*[xх×]\s*(\d+)", str(dim_str))
+        match = re.search(r"(\d+)\s*[xх×*]\s*(\d+)", str(dim_str))
         if match:
             return float(match.group(1)), float(match.group(2))
+        length_match = re.search(r"(\d+)\s*м?м?", str(dim_str))
+        if length_match:
+            value = float(length_match.group(1))
+            return value, value
         return None, None
+
+    def _product_type(self, name: str) -> str:
+        lower = str(name).lower()
+        if any(keyword in lower for keyword in FIXTURE_KEYWORDS):
+            return "fixture"
+        if any(keyword in lower for keyword in SUPPORT_KEYWORDS):
+            return "support"
+        return "other"
+
+    def _type_penalty(self, pos_name: str, cat_name: str) -> float:
+        pos_type = self._product_type(pos_name)
+        cat_type = self._product_type(cat_name)
+        if pos_type == "fixture" and cat_type == "support":
+            return TYPE_MISMATCH_PENALTY
+        if pos_type == "support" and cat_type == "fixture":
+            return TYPE_MISMATCH_PENALTY
+        return 0.0
 
     def _name_distance(self, pos_name: str, cat_name: str) -> float:
         if not pos_name or not cat_name:
@@ -96,7 +157,9 @@ class CatalogMatcher:
         return 1.0 - ratio
 
     def _calc_distance(self, pos: Dict, row: Dict) -> float:
-        distance = self._name_distance(pos.get("name", ""), row.get("_name", "")) * NAME_WEIGHT
+        cat_name = str(row.get("_name", "") or "")
+        distance = self._name_distance(pos.get("name", ""), cat_name) * NAME_WEIGHT
+        distance += self._type_penalty(pos.get("name", ""), cat_name)
         param_count = 0
 
         for field, scale in (
@@ -127,7 +190,8 @@ class CatalogMatcher:
 
         for sheet in self.catalog:
             for _, row in self.catalog[sheet].iterrows():
-                if pd.isna(row.get("_name")) and pd.isna(row.get("_specs")):
+                cat_name = row.get("_name")
+                if pd.isna(cat_name) or not str(cat_name).strip():
                     continue
                 dist = self._calc_distance(pos, row.to_dict())
                 if dist < best_dist:
